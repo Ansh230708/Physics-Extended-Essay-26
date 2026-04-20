@@ -1,0 +1,733 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox as MB
+import math
+import csv
+from pathlib import Path
+from datetime import datetime, timedelta
+import numpy as np
+
+# ===================== CONSTANTS (SI)
+MU_EARTH = 3.986004418e14       # m^3/s^2
+MU_SUN   = 1.32712440018e20     # m^3/s^2
+MU_MOON  = 4.9048695e12         # m^3/s^2
+RE       = 6_378_137.0          # m
+J2       = 1.08262668e-3
+
+A_SUN  = 1.495978707e11         # m
+E_SUN  = 0.0167
+A_MOON = 384_400e3              # m
+E_MOON = 0.0549
+
+OBLIQUITY = math.radians(23.439281)  # Sun plane tilt vs equator
+I_LUNAR   = math.radians(23.5)       # effective lunar tilt (averaged model)
+LUNAR_NODE_RATE = -2.0 * math.pi / (18.6 * 365.2422 * 86400.0)  # rad/s
+
+# ===================== SIM CONFIG
+SIM_DAYS     = 730      # total sim time (2 years)
+TIME_STEP    = 60.0     # seconds
+DRAW_EVERY   = 800      # draw every N steps
+TRAIL_MAX    = 1200     # trail cap
+AVERAGE_LUNAR_NODE = True  # default: averaged lunar node
+
+# ===================== MATH HELPERS
+def solve_kepler(M, e):
+    E = M
+    for _ in range(12):
+        f  = E - e * math.sin(E) - M
+        fp = 1.0 - e * math.cos(E)
+        E -= f / fp
+    return E
+
+def r3(theta):
+    c = math.cos(theta); s = math.sin(theta)
+    return ((c,-s,0.0),(s,c,0.0),(0.0,0.0,1.0))
+
+def r1(theta):
+    c = math.cos(theta); s = math.sin(theta)
+    return ((1.0,0.0,0.0),(0.0,c,-s),(0.0,s,c))
+
+def matmul3(A, B):
+    return (
+        (A[0][0]*B[0][0]+A[0][1]*B[1][0]+A[0][2]*B[2][0],
+         A[0][0]*B[0][1]+A[0][1]*B[1][1]+A[0][2]*B[2][1],
+         A[0][0]*B[0][2]+A[0][1]*B[1][2]+A[0][2]*B[2][2]),
+        (A[1][0]*B[0][0]+A[1][1]*B[1][0]+A[1][2]*B[2][0],
+         A[1][0]*B[0][1]+A[1][1]*B[1][1]+A[1][2]*B[2][1],
+         A[1][0]*B[0][2]+A[1][1]*B[1][2]+A[1][2]*B[2][2]),
+        (A[2][0]*B[0][0]+A[2][1]*B[1][0]+A[2][2]*B[2][0],
+         A[2][0]*B[0][1]+A[2][1]*B[1][1]+A[2][2]*B[2][1],
+         A[2][0]*B[0][2]+A[2][1]*B[1][2]+A[2][2]*B[2][2])
+    )
+
+def matvec3(A, v):
+    return (
+        A[0][0]*v[0]+A[0][1]*v[1]+A[0][2]*v[2],
+        A[1][0]*v[0]+A[1][1]*v[1]+A[1][2]*v[2],
+        A[2][0]*v[0]+A[2][1]*v[1]+A[2][2]*v[2]
+    )
+
+def mutual_inclination(i_sat, tilt_plane, Omega_sat, Omega_plane):
+    c = (math.cos(i_sat)*math.cos(tilt_plane) +
+         math.sin(i_sat)*math.sin(tilt_plane)*math.cos(Omega_sat - Omega_plane))
+    return math.acos(max(-1.0, min(1.0, c)))
+
+def third_body_factor(mu_body, a_sat, a_body, e_body):
+    return (mu_body / MU_EARTH) * (a_sat / a_body)**3 / (1.0 - e_body**2)**1.5
+
+def secular_rates(a, e, i, Omega, t_seconds):
+    # mean motion
+    n0 = math.sqrt(MU_EARTH / a**3)
+
+    den12 = (1.0 - e**2)**2
+    den32 = (1.0 - e**2)**1.5
+
+    # J2 seculars
+    dOmega_J2 = -1.5 * n0 * J2 * (RE / a)**2 * math.cos(i) / den12
+    domega_J2 =  0.75 * n0 * J2 * (RE / a)**2 * (5.0*math.cos(i)**2 - 1.0) / den12
+    dM_corr_J2 = 0.75 * n0 * J2 * (RE / a)**2 * (3.0*math.sin(i)**2 - 2.0) / den32
+
+    # Sun (double-averaged)
+    i_sun = mutual_inclination(i, OBLIQUITY, Omega, 0.0)
+    A_sun = third_body_factor(MU_SUN, a, A_SUN, E_SUN)
+    dOmega_sun = -1.5 * n0 * A_sun * math.cos(i_sun)
+    domega_sun =  0.75 * n0 * A_sun * (5.0*math.cos(i_sun)**2 - 1.0)
+    dM_corr_sun = - n0 * A_sun * (3.0*math.cos(i_sun)**2 - 1.0)
+
+    # Moon (double-averaged; optional nodal regression)
+    Omega_moon_plane = 0.0 if AVERAGE_LUNAR_NODE else (LUNAR_NODE_RATE * t_seconds)
+    i_moon = mutual_inclination(i, I_LUNAR, Omega, Omega_moon_plane)
+    A_moon = third_body_factor(MU_MOON, a, A_MOON, E_MOON)
+    dOmega_moon = -1.5 * n0 * A_moon * math.cos(i_moon)
+    domega_moon =  0.75 * n0 * A_moon * (5.0*math.cos(i_moon)**2 - 1.0)
+    dM_corr_moon = - n0 * A_moon * (3.0*math.cos(i_moon)**2 - 1.0)
+
+    # totals (rad/s)
+    dOmega_total = dOmega_J2 + dOmega_sun + dOmega_moon
+    domega_total = domega_J2 + domega_sun + domega_moon
+    dM_total     = n0 + dM_corr_J2 + dM_corr_sun + dM_corr_moon
+    return dOmega_total, domega_total, dM_total
+
+# ===================== FILE PARSERS =====================
+def parse_epoch_tle_line1(line1: str) -> datetime:
+    # YYDDD.DDDDD in cols 19-32 (1-based). Using 0-based slices here.
+    yy = int(line1[18:20])
+    year = 2000 + yy if yy < 57 else 1900 + yy
+    doy = float(line1[20:32])
+    day_int = int(doy); frac = doy - day_int
+    return datetime(year, 1, 1) + timedelta(days=day_int - 1) + timedelta(days=frac)
+
+def parse_line2_elements(line2: str):
+    # standard TLE slices (0-based)
+    inc  = float(line2[8:16])           # deg
+    raan = float(line2[17:25])          # deg
+    ecc  = float(f"0.{line2[26:33].strip()}")  # implied decimal
+    argp = float(line2[34:42])          # deg
+    M    = float(line2[43:51])          # deg
+    n    = float(line2[52:63])          # rev/day
+    return inc, raan, ecc, argp, M, n
+
+def load_tle_pairs_from_text(path: str):
+    lines = [ln.strip() for ln in Path(path).read_text().splitlines() if ln.strip()]
+    pairs = []
+    i = 0
+    while i < len(lines) - 1:
+        if lines[i].startswith("1 ") and lines[i+1].startswith("2 "):
+            pairs.append((lines[i], lines[i+1]))
+            i += 2
+        else:
+            i += 1
+    return pairs
+
+def try_parse_epoch_str(s: str):
+    s = str(s).strip()
+    if not s:
+        return None
+    # ISO-8601
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        pass
+    # Common patterns
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S",
+                "%Y-%m-%d", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            pass
+    # Excel serial number?
+    try:
+        val = float(s)
+        origin = datetime(1899, 12, 30)
+        return origin + timedelta(days=val)
+    except Exception:
+        pass
+    # YYDDD.DDDDD (TLE-like string)
+    try:
+        if len(s) >= 5 and all(ch.isdigit() or ch == '.' for ch in s):
+            yy = int(s[:2]); year = 2000 + yy if yy < 57 else 1900 + yy
+            doy = float(s[2:]); day_int = int(doy); frac = doy - day_int
+            return datetime(year, 1, 1) + timedelta(days=day_int - 1) + timedelta(days=frac)
+    except Exception:
+        pass
+    return None
+
+def load_elements_from_csv(path: str):
+    """
+    Accepts a CSV containing (case-insensitive) columns:
+      - Epoch (ISO or parseable)
+      - Inclination (deg) / i_deg / Inclination
+      - RAAN (deg) / RAAN
+      - Eccentricity / e
+      - Arg of Perigee (deg) / omega_deg / ArgPerigee
+      - Mean Anomaly (deg) / M_deg
+      - Mean Motion (rev/day) / n_rev_day   (optional if a_km is given)
+      - Semi-Major Axis a (km) / a_km       (optional; if missing, computed from n)
+    Returns list of rows dicts, sorted by epoch, latest last.
+    """
+    with open(path, newline="") as f:
+        rdr = csv.reader(f)
+        rows = list(rdr)
+    if not rows:
+        return []
+    header = [h.strip() for h in rows[0]]
+
+    def idx_of(*names):
+        for name in names:
+            for j, h in enumerate(header):
+                if h.strip().lower() == name.strip().lower():
+                    return j
+        return None
+
+    idx_epoch = idx_of("Epoch", "epoch", "Date", "datetime", "time", "Timestamp")
+    idx_i     = idx_of("Inclination (deg)", "Inclination", "i_deg", "i (deg)", "i")
+    idx_raan  = idx_of("RAAN (deg)", "RAAN", "Omega (deg)", "Ω (deg)")
+    idx_e     = idx_of("Eccentricity", "e")
+    idx_argp  = idx_of("Arg of Perigee (deg)", "ArgPerigee", "omega_deg", "omega (deg)", "ω (deg)")
+    idx_M     = idx_of("Mean Anomaly (deg)", "M_deg", "M (deg)")
+    idx_n     = idx_of("Mean Motion (rev/day)", "n_rev_day", "n (rev/day)", "mean_motion")
+    idx_a_km  = idx_of("Semi-Major Axis a (km)", "a_km", "a (km)")
+
+    if idx_epoch is None:
+        raise ValueError("CSV must include an 'Epoch' (time) column.")
+    if any(x is None for x in [idx_i, idx_raan, idx_e, idx_argp, idx_M]) or (idx_n is None and idx_a_km is None):
+        raise ValueError("CSV is missing one or more required columns: i, RAAN, e, argp, M, and either n (rev/day) or a_km.")
+
+    data = []
+    for r in rows[1:]:
+        if not any(r):
+            continue
+        try:
+            ep = try_parse_epoch_str(r[idx_epoch])
+            if ep is None:
+                continue
+            inc = float(str(r[idx_i]).strip())
+            raan = float(str(r[idx_raan]).strip())
+            ecc = float(str(r[idx_e]).strip())
+            argp = float(str(r[idx_argp]).strip())
+            M = float(str(r[idx_M]).strip())
+            if idx_a_km is not None and r[idx_a_km].strip() != "":
+                a_km = float(str(r[idx_a_km]).strip())
+                a_m = a_km * 1000.0
+            else:
+                n_rev_day = float(str(r[idx_n]).strip())
+                n_rad_s = n_rev_day * 2.0 * math.pi / 86400.0
+                a_m = (MU_EARTH / (n_rad_s**2))**(1.0/3.0)
+            data.append({"Epoch": ep, "i": inc, "RAAN": raan, "e": ecc, "argp": argp, "M": M, "a_m": a_m})
+        except Exception:
+            continue
+    data.sort(key=lambda d: d["Epoch"])
+    return data
+
+# ===================== NUMPY HELPERS =====================
+def unwrap_deg(arr_deg):
+    r = np.deg2rad(np.asarray(arr_deg, dtype=float))
+    return np.rad2deg(np.unwrap(r))
+
+def slope_deg_per_day(t_days, y_deg):
+    x = np.asarray(t_days, dtype=float)
+    y = np.asarray(y_deg, dtype=float)
+    A = np.vstack([x, np.ones_like(x)]).T
+    m, _ = np.linalg.lstsq(A, y, rcond=None)[0]
+    return float(m)
+
+def weighted_avg(values, weights):
+    v = np.asarray(values, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    if np.allclose(w.sum(), 0.0):
+        return float(np.nan)
+    return float((v * w).sum() / w.sum())
+
+def revday_from_a_km(a_km):
+    MU_EARTH_km = 398600.4418  # km^3/s^2
+    n_rad_s = math.sqrt(MU_EARTH_km / (a_km**3))
+    return n_rad_s * 86400.0 / (2.0 * math.pi)  # rev/day
+
+# ===================== MAIN APP =====================
+class OrbitalSim3D:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("3D Orbital Secular Simulation — CSV/TLE Ready")
+        self.root.geometry("1280x860")
+        self.root.minsize(1100, 760)
+
+        container = tk.Frame(self.root)
+        container.grid(row=0, column=0, sticky="nsew")
+        self.root.rowconfigure(0, weight=1)
+        self.root.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(1, weight=1)
+
+        # Sidebar
+        sidebar = tk.Frame(container, padx=10, pady=10)
+        sidebar.grid(row=0, column=0, sticky="ns")
+
+        # Canvas area
+        right = tk.Frame(container, padx=8, pady=8, bg="black")
+        right.grid(row=0, column=1, sticky="nsew")
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        self.canvas_w = 980
+        self.canvas_h = 820
+        self.canvas = tk.Canvas(right, width=self.canvas_w, height=self.canvas_h, bg="black", highlightthickness=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+
+        self.output = tk.Label(right, text="", fg="white", bg="black", font=("Courier", 11))
+        self.output.grid(row=1, column=0, sticky="ew", pady=(6,0))
+
+        self.epoch_label = tk.Label(sidebar, text="Epoch: —", anchor="w")
+        self.epoch_label.pack(fill="x", pady=(0,6))
+
+        self.entries = {}
+        for label, default in [
+            ("Semi-Major Axis a (km)", "12270"),
+            ("Eccentricity e", "0.0045"),
+            ("Inclination i (deg)", "109.84"),
+            ("Initial RAAN Ω0 (deg)", "0.0"),
+            ("Initial ω0 (deg)", "0.0"),
+            ("Initial M0 (deg)", "0.0"),
+        ]:
+            fr = tk.Frame(sidebar); fr.pack(fill="x", pady=3)
+            tk.Label(fr, text=label + ": ").pack(side="left")
+            ent = tk.Entry(fr, width=14); ent.insert(0, default); ent.pack(side="right")
+            self.entries[label] = ent
+
+        ctrl = tk.Frame(sidebar); ctrl.pack(fill="x", pady=(10,4))
+        tk.Button(ctrl, text="Start", command=self.start, width=12).pack(pady=2)
+        tk.Button(ctrl, text="Stop", command=self.stop, width=12).pack(pady=2)
+        tk.Button(ctrl, text="Save CSV", command=self.save_csv, width=12).pack(pady=2)
+        tk.Button(ctrl, text="Reset", command=self.reset, width=12).pack(pady=2)
+
+        tk.Button(sidebar, text="Load LAGEOS-1 Data…", command=self.load_data, width=18).pack(pady=(8,2))
+        tk.Button(sidebar, text="Compare vs Data…", command=self.compare_vs_data, width=18).pack(pady=2)
+
+        self.node_mode = tk.StringVar(value="Averaged Moon Node")
+        tk.Radiobutton(sidebar, text="Averaged Moon Node", variable=self.node_mode,
+                       value="Averaged Moon Node", command=self.toggle_node_mode).pack(anchor="w", pady=(8,0))
+        tk.Radiobutton(sidebar, text="18.6-yr Moon Node", variable=self.node_mode,
+                       value="18.6-yr Moon Node", command=self.toggle_node_mode).pack(anchor="w")
+
+        tk.Label(sidebar, text="3D View:", pady=6).pack(anchor="w")
+        tk.Label(sidebar, text="Drag: orbit camera\nWheel: zoom").pack(anchor="w")
+
+        # Mouse bindings
+        self.canvas.bind("<Button-1>", self.on_mouse_down)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+        self.canvas.bind("<MouseWheel>", self.on_wheel)       # Windows/macOS
+        self.canvas.bind("<Button-4>", self.on_wheel_linux_up)   # Linux scroll up
+        self.canvas.bind("<Button-5>", self.on_wheel_linux_down) # Linux scroll down
+
+        # State
+        self.running = False
+        self.data_log = []
+        self.trail3d = []
+        self.ticks = 0
+
+        self.a = None; self.e = None; self.i = None
+        self.Omega = None; self.omega = None; self.M = None
+
+        self.cx = self.canvas_w // 2
+        self.cy = self.canvas_h // 2
+        self.yaw = 0.8
+        self.pitch = 0.4
+        self.cam_dist = 1.0
+        self.proj_f = min(self.canvas_w, self.canvas_h) * 0.9
+        self.near_clip = 0.5
+        self.drag_last = None
+
+        self.current_epoch = None
+
+    # ------------- UI Actions -------------
+    def toggle_node_mode(self):
+        global AVERAGE_LUNAR_NODE
+        AVERAGE_LUNAR_NODE = (self.node_mode.get() == "Averaged Moon Node")
+
+    def reset(self):
+        self.stop()
+        self.canvas.delete("all")
+        self.data_log.clear()
+        self.trail3d.clear()
+        self.ticks = 0
+        self.output.config(text="")
+
+    def start(self):
+        if self.running:
+            return
+        try:
+            a_km = float(self.entries["Semi-Major Axis a (km)"].get())
+            e    = float(self.entries["Eccentricity e"].get())
+            i_deg= float(self.entries["Inclination i (deg)"].get())
+            O0   = float(self.entries["Initial RAAN Ω0 (deg)"].get())
+            w0   = float(self.entries["Initial ω0 (deg)"].get())
+            M0   = float(self.entries["Initial M0 (deg)"].get())
+        except Exception:
+            self.output.config(text="Invalid input.")
+            return
+
+        a = a_km * 1000.0
+        if a <= RE or e < 0.0 or e >= 0.999:
+            self.output.config(text="Check a>RE and 0<=e<1.")
+            return
+
+        # initialize sim state (independent physics after this)
+        self.a = a; self.e = e; self.i = math.radians(i_deg)
+        self.Omega = math.radians(O0); self.omega = math.radians(w0); self.M = math.radians(M0)
+
+        # camera range
+        rmax = a * (1.0 + e)
+        self.cam_dist = 3.5 * rmax
+
+        self.trail3d.clear()
+        self.data_log.clear()
+        self.ticks = 0
+        self.running = True
+        self.step_loop()
+
+    def stop(self):
+        self.running = False
+
+    # ------------- Camera / Mouse -------------
+    def on_mouse_down(self, event):
+        self.drag_last = (event.x, event.y)
+
+    def on_mouse_drag(self, event):
+        if self.drag_last is None:
+            self.drag_last = (event.x, event.y); return
+        dx = event.x - self.drag_last[0]
+        dy = event.y - self.drag_last[1]
+        self.drag_last = (event.x, event.y)
+        self.yaw   += dx * 0.005
+        self.pitch += dy * 0.005
+        self.pitch = max(-math.pi/2+0.05, min(math.pi/2-0.05, self.pitch))
+        if not self.running:
+            self.redraw_last()
+
+    def on_wheel(self, event):
+        factor = 0.9 if event.delta > 0 else 1.1
+        self.cam_dist = max(self.cam_dist * factor, 1.0)
+        if not self.running:
+            self.redraw_last()
+
+    def on_wheel_linux_up(self, event):
+        self.cam_dist = max(self.cam_dist * 0.9, 1.0)
+        if not self.running:
+            self.redraw_last()
+
+    def on_wheel_linux_down(self, event):
+        self.cam_dist = max(self.cam_dist * 1.1, 1.0)
+        if not self.running:
+            self.redraw_last()
+
+    # ------------- Simulation Loop -------------
+    def step_loop(self):
+        if not self.running:
+            return
+        steps_chunk = 2000
+        end_ticks = min(int(SIM_DAYS*86400.0/TIME_STEP), self.ticks + steps_chunk)
+        while self.ticks < end_ticks and self.running:
+            t_seconds = self.ticks * TIME_STEP
+
+            # secular propagation (rad/s * dt)
+            dO, dw, dM = secular_rates(self.a, self.e, self.i, self.Omega, t_seconds)
+            self.Omega += dO * TIME_STEP
+            self.omega += dw * TIME_STEP
+            self.M     += dM * TIME_STEP
+
+            # osculating pos from mean elements (Kepler)
+            M_wrapped = self.M % (2.0*math.pi)
+            E = solve_kepler(M_wrapped, self.e)
+            f = 2.0 * math.atan2(math.sqrt(1.0 + self.e) * math.sin(E/2.0),
+                                 math.sqrt(1.0 - self.e) * math.cos(E/2.0))
+            r = self.a * (1.0 - self.e**2) / (1.0 + self.e * math.cos(f))
+            x_p = r * math.cos(f); y_p = r * math.sin(f); z_p = 0.0
+
+            # PQW->ECI: R = R3(Omega) * R1(i) * R3(omega)
+            R_eci = matmul3(r3(self.Omega), matmul3(r1(self.i), r3(self.omega)))
+            x_e, y_e, z_e = matvec3(R_eci, (x_p, y_p, z_p))
+
+            self.trail3d.append((x_e, y_e, z_e))
+            if len(self.trail3d) > TRAIL_MAX:
+                self.trail3d.pop(0)
+
+            if self.ticks % DRAW_EVERY == 0:
+                self.redraw_last()
+
+            if self.ticks % 300 == 0:
+                self.data_log.append([
+                    self.ticks * TIME_STEP,
+                    (self.Omega % (2.0*math.pi))*180.0/math.pi,
+                    (self.omega % (2.0*math.pi))*180.0/math.pi,
+                    (self.M % (2.0*math.pi))*180.0/math.pi
+                ])
+
+            self.ticks += 1
+
+        if self.running and self.ticks < int(SIM_DAYS*86400.0/TIME_STEP):
+            self.root.after(1, self.step_loop)
+        else:
+            self.running = False
+            self.output.config(text="Simulation finished. Use Save CSV to export.")
+
+    # ------------- 3D View -------------
+    def view_rotate(self, v):
+        cy = math.cos(self.yaw); sy = math.sin(self.yaw)
+        cx = math.cos(self.pitch); sx = math.sin(self.pitch)
+        x, y, z = v
+        xr =  cy*x + sy*z
+        zr = -sy*x + cy*z
+        yr =  cx*y - sx*zr
+        zr2=  sx*y + cx*zr
+        return xr, yr, zr2
+
+    def project(self, v):
+        xr, yr, zr = self.view_rotate(v)
+        zc = zr + self.cam_dist
+        if zc < self.near_clip:
+            return None
+        x2 = self.cx + self.proj_f * (xr / zc)
+        y2 = self.cy - self.proj_f * (yr / zc)
+        return (x2, y2)
+
+    def redraw_last(self):
+        self.canvas.delete("all")
+
+        # equatorial grid circle (z=0)
+        grid_r = RE * 4.0
+        grid_pts = []
+        for k in range(0, 361, 10):
+            ang = math.radians(k)
+            p = (grid_r*math.cos(ang), grid_r*math.sin(ang), 0.0)
+            pr = self.project(p)
+            if pr:
+                grid_pts.append(pr)
+        if len(grid_pts) > 1:
+            flat = []
+            for p in grid_pts:
+                flat.extend(p)
+            try:
+                self.canvas.create_line(*flat, fill="gray", width=1)
+            except Exception:
+                self.canvas.create_line(grid_pts, fill="gray", width=1)
+
+        # Earth point
+        origin = self.project((0.0,0.0,0.0))
+        if origin:
+            x0, y0 = origin
+            self.canvas.create_oval(x0-4, y0-4, x0+4, y0+4, fill="white", outline="white")
+
+        # trail & satellite
+        if len(self.trail3d) > 1:
+            last = None
+            for p3 in self.trail3d:
+                pr = self.project(p3)
+                if pr and last:
+                    self.canvas.create_line(last[0], last[1], pr[0], pr[1], fill="cyan", width=1)
+                last = pr
+            last3 = self.trail3d[-1]
+            pr = self.project(last3)
+            if pr:
+                x, y = pr
+                self.canvas.create_oval(x-3, y-3, x+3, y+3, fill="red", outline="")
+
+        years = (self.ticks * TIME_STEP) / (365.2422*86400.0)
+        txt = "t={:.3f} yr  Ω={:.2f}°  ω={:.2f}°  M={:.2f}°".format(
+            years,
+            (self.Omega % (2.0*math.pi))*180.0/math.pi if self.Omega is not None else 0.0,
+            (self.omega % (2.0*math.pi))*180.0/math.pi if self.omega is not None else 0.0,
+            (self.M % (2.0*math.pi))*180.0/math.pi if self.M is not None else 0.0
+        )
+        if self.current_epoch:
+            txt = f"{txt} | Epoch: {self.current_epoch.strftime('%Y-%m-%d %H:%M:%S')}"
+        self.output.config(text=txt)
+
+    # ------------- CSV I/O -------------
+    def save_csv(self):
+        if not self.data_log:
+            self.output.config(text="No data to save yet.")
+            return
+        fn = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files","*.csv")])
+        if not fn:
+            return
+        with open(fn, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["Time (s)", "RAAN Ω (deg)", "Arg of Perigee ω (deg)", "Mean Anomaly M (deg)"])
+            w.writerows(self.data_log)
+        self.output.config(text=f"CSV saved: {fn}")
+
+    # ------------- Loaders / Compare -------------
+    def load_data(self):
+        path = filedialog.askopenfilename(
+            title="Load LAGEOS-1 data (CSV or TLE)",
+            filetypes=[("CSV files","*.csv"),("TLE text","*.txt *.tle"),("All files","*.*")]
+        )
+        if not path:
+            MB.showinfo("Load Data", "No file selected.")
+            return
+        ext = Path(path).suffix.lower()
+        try:
+            if ext == ".csv":
+                recs = load_elements_from_csv(path)
+                if not recs:
+                    MB.showerror("Load Data", "CSV parsed, but no valid rows found.")
+                    return
+                ep, inc, raan, ecc, argp, M, a_m = recs[-1]["Epoch"], recs[-1]["i"], recs[-1]["RAAN"], recs[-1]["e"], recs[-1]["argp"], recs[-1]["M"], recs[-1]["a_m"]
+            else:
+                pairs = load_tle_pairs_from_text(path)
+                parsed = []
+                for l1, l2 in pairs:
+                    try:
+                        ep = parse_epoch_tle_line1(l1)
+                        inc, raan, ecc, argp, M, n = parse_line2_elements(l2)
+                        n_rad_s = n * 2.0 * math.pi / 86400.0
+                        a_m = (MU_EARTH / (n_rad_s**2))**(1.0/3.0)
+                        parsed.append((ep, inc, raan, ecc, argp, M, a_m))
+                    except Exception:
+                        continue
+                if not parsed:
+                    MB.showerror("Load Data", "Could not parse any TLE pairs in this file.")
+                    return
+                ep, inc, raan, ecc, argp, M, a_m = sorted(parsed, key=lambda x: x[0])[-1]
+
+            # populate UI
+            self.entries["Semi-Major Axis a (km)"].delete(0, tk.END); self.entries["Semi-Major Axis a (km)"].insert(0, f"{a_m/1000.0:.6f}")
+            self.entries["Eccentricity e"].delete(0, tk.END);         self.entries["Eccentricity e"].insert(0, f"{ecc:.7f}")
+            self.entries["Inclination i (deg)"].delete(0, tk.END);     self.entries["Inclination i (deg)"].insert(0, f"{inc:.6f}")
+            self.entries["Initial RAAN Ω0 (deg)"].delete(0, tk.END);   self.entries["Initial RAAN Ω0 (deg)"].insert(0, f"{raan:.6f}")
+            self.entries["Initial ω0 (deg)"].delete(0, tk.END);        self.entries["Initial ω0 (deg)"].insert(0, f"{argp:.6f}")
+            self.entries["Initial M0 (deg)"].delete(0, tk.END);        self.entries["Initial M0 (deg)"].insert(0, f"{M:.6f}")
+            self.current_epoch = ep
+            self.epoch_label.config(text=f"Epoch: {ep.strftime('%Y-%m-%d %H:%M:%S')}")
+            MB.showinfo("Load Data", "Loaded and populated fields from file.\n(Your simulation remains independent after Start.)")
+        except Exception as e:
+            MB.showerror("Load Data", f"Unexpected error:\n{e}")
+
+    def compare_vs_data(self):
+        path = filedialog.askopenfilename(
+            title="Pick the same LAGEOS-1 data file (CSV or TLE)",
+            filetypes=[("CSV files","*.csv"),("TLE text","*.txt *.tle"),("All files","*.*")]
+        )
+        if not path:
+            return
+        try:
+            times, RAANs, ARGs, Ms = [], [], [], []
+            ns_revday, a_kms = [], []
+            ext = Path(path).suffix.lower()
+
+            if ext == ".csv":
+                recs = load_elements_from_csv(path)
+                if len(recs) < 3:
+                    MB.showerror("Compare", "Need at least 3 rows in CSV to estimate drifts.")
+                    return
+                for r in recs:
+                    times.append(r["Epoch"])
+                    RAANs.append(r["RAAN"])
+                    ARGs.append(r["argp"])
+                    Ms.append(r["M"])
+                    if "a_m" in r and r["a_m"] is not None:
+                        a_kms.append(r["a_m"]/1000.0)
+            else:
+                pairs = load_tle_pairs_from_text(path)
+                parsed = []
+                for l1, l2 in pairs:
+                    try:
+                        ep = parse_epoch_tle_line1(l1)
+                        inc, raan, ecc, argp, M, n = parse_line2_elements(l2)
+                        parsed.append((ep, raan, argp, M, n))
+                    except Exception:
+                        continue
+                if len(parsed) < 3:
+                    MB.showerror("Compare", "Need at least 3 TLE pairs to estimate drifts.")
+                    return
+                parsed.sort(key=lambda x: x[0])
+                for ep, raan, argp, M, n in parsed:
+                    times.append(ep); RAANs.append(raan); ARGs.append(argp); Ms.append(M)
+                    ns_revday.append(n)
+
+            # Build time base
+            t0 = times[0]
+            t_days = np.array([(t - t0).total_seconds()/86400.0 for t in times], dtype=float)
+
+            # Unwrap for RAAN, ω
+            RAAN_u = unwrap_deg(RAANs); ARG_u = unwrap_deg(ARGs)
+
+            # OLS secular drifts for RAAN, ω
+            r_RAAN = slope_deg_per_day(t_days, RAAN_u)
+            r_ARG  = slope_deg_per_day(t_days, ARG_u)
+
+            # Robust Ṁ observed:
+            # 1) If we have n (rev/day) per record (TLE), compute time-weighted average of n.
+            # 2) Else if we have a_km per record (CSV), compute n from each a and time-weight.
+            # 3) Else, as a last resort, compute n from the CURRENT sim a_km in the UI.
+            if len(ns_revday) >= 2:
+                dt = np.diff(t_days)
+                n_mid = (np.array(ns_revday[:-1]) + np.array(ns_revday[1:]))/2.0
+                n_obs = weighted_avg(n_mid, dt)
+                M_obs_degday = 360.0 * n_obs
+            elif len(a_kms) >= 2:
+                dt = np.diff(t_days)
+                n_mid = (np.array([revday_from_a_km(x) for x in a_kms[:-1]]) +
+                         np.array([revday_from_a_km(x) for x in a_kms[1:]])) / 2.0
+                n_obs = weighted_avg(n_mid, dt)
+                M_obs_degday = 360.0 * n_obs
+            else:
+                try:
+                    a_km_ui = float(self.entries["Semi-Major Axis a (km)"].get())
+                except Exception:
+                    MB.showerror("Compare", "Cannot infer mean motion for Ṁ. Ensure the CSV has either n (rev/day) or a (km), or the UI 'a (km)' is filled.")
+                    return
+                M_obs_degday = 360.0 * revday_from_a_km(a_km_ui)
+
+            # Model predicted drifts at start epoch (rad/s -> deg/day)
+            try:
+                a_km = float(self.entries["Semi-Major Axis a (km)"].get())
+                e    = float(self.entries["Eccentricity e"].get())
+                i_deg= float(self.entries["Inclination i (deg)"].get())
+                O0   = float(self.entries["Initial RAAN Ω0 (deg)"].get())
+            except Exception:
+                MB.showerror("Compare", "Please ensure a,e,i,Ω0 are filled.")
+                return
+
+            a_m = a_km * 1000.0; i = math.radians(i_deg); O0r = math.radians(O0)
+            dO, dw, dM = secular_rates(a_m, e, i, O0r, 0.0)
+            todeg = 180.0/math.pi
+            model_RAAN = dO * todeg * 86400.0
+            model_ARG  = dw * todeg * 86400.0
+            model_M    = dM * todeg * 86400.0
+
+            # Show comparison
+            win = tk.Toplevel(self.root); win.title("Comparison — Observed (from file) vs Model")
+            txt = tk.Text(win, width=80, height=16); txt.pack(fill="both", expand=True)
+            txt.insert("end", "Observed OLS drifts from file (deg/day)\n")
+            txt.insert("end", f"  RAAN: {r_RAAN:.6f}\n")
+            txt.insert("end", f"  ω:    {r_ARG:.6f}\n")
+            txt.insert("end", f"  M:    {M_obs_degday:.6f}   (from mean motion)\n\n")
+            txt.insert("end", "Model predicted drifts (deg/day)\n")
+            txt.insert("end", f"  RAAN: {model_RAAN:.6f}\n")
+            txt.insert("end", f"  ω:    {model_ARG:.6f}\n")
+            txt.insert("end", f"  M:    {model_M:.6f}\n")
+            txt.configure(state="disabled")
+        except Exception as e:
+            MB.showerror("Compare", f"Unexpected error:\n{e}")
+
+if __name__ == "__main__":
+    OrbitalSim3D().root.mainloop()
